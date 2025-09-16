@@ -17,7 +17,8 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, LSTM, Bidirectional
 
 # Metaheuristics
-from mealpy.swarm_based import GWO, SCA
+from mealpy.swarm_based import GWO
+
 
 
 # ===========================
@@ -78,8 +79,6 @@ y_pred_xgb = xgb.predict(X_test)
 # ===========================
 # 5b. Grey Wolf Optimizer (GWO) for RF Hyperparameter Tuning
 # ===========================
-from mealpy.swarm_based import GWO, SCA   # ✅ FIXED IMPORT
-
 def rf_fitness(params):
     n_estimators = int(params[0])
     max_depth = int(params[1])
@@ -103,14 +102,15 @@ print("\n[Grey Wolf Optimizer]")
 print("Best RF Params:", best_params_gwo)
 print("Best Accuracy:", 1 - best_fitness_gwo)
 
-# ===========================
-# 5c. Sand Cat Optimization (SCA) for RF Hyperparameter Tuning
-# ===========================
-sca_model = SCA.OriginalSCA(epoch=10, pop_size=10)
-best_params_sca, best_fitness_sca = sca_model.solve(problem)
-print("\n[Sand Cat Optimization]")
-print("Best RF Params:", best_params_sca)
-print("Best Accuracy:", 1 - best_fitness_sca)
+# Train RF with GWO params
+rf_gwo = RandomForestClassifier(
+    n_estimators=int(best_params_gwo[0]),
+    max_depth=int(best_params_gwo[1]),
+    random_state=42
+)
+rf_gwo.fit(X_train, y_train)
+y_pred_gwo = rf_gwo.predict(X_test)
+
 
 # ===========================
 # 6. Bi-LSTM (separate split)
