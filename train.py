@@ -90,8 +90,8 @@ def rf_fitness(params):
 # Search space for RF
 problem = {
     "fit_func": rf_fitness,
-    "lb": [50, 2],     # lower bounds (n_estimators, max_depth)
-    "ub": [300, 15],   # upper bounds
+    "lb": [50, 2],
+    "ub": [300, 15],
     "minmax": "min",
 }
 
@@ -160,8 +160,8 @@ def bilstm_fitness(params):
 # Search space: [units1, units2, dropout1, dropout2, lr]
 problem = {
     "fit_func": bilstm_fitness,
-    "lb": [32, 16, 0.1, 0.1, 0.0001],       # lower bounds
-    "ub": [256, 128, 0.5, 0.5, 0.01],       # upper bounds
+    "lb": [32, 16, 0.1, 0.1, 0.0001],
+    "ub": [256, 128, 0.5, 0.5, 0.01],
     "minmax": "min",
 }
 
