@@ -14,11 +14,11 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 # Deep Learning
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout, LSTM, Bidirectional
+from tensorflow.keras.layers import Dense, Dropout, LSTM, Bidirectional, Input
+from tensorflow.keras.callbacks import EarlyStopping
 
 # Metaheuristics
 from mealpy.swarm_based import GWO
-
 
 
 # ===========================
@@ -52,86 +52,33 @@ X_train, X_test, y_train, y_test = train_test_split(
 # ===========================
 # 3. Decision Tree
 # ===========================
-dt_params = {'max_depth':[2,3,4,5], 'criterion':['gini','entropy']}
-dt = GridSearchCV(DecisionTreeClassifier(), dt_params, cv=5, scoring='accuracy')
-dt.fit(X_train, y_train)
-y_pred_dt = dt.predict(X_test)
+# (Removed)
 
 # ===========================
 # 4. Random Forest (GridSearch)
 # ===========================
-rf_params = {'n_estimators':[100, 500], 'min_samples_split':[4,5]}
-rf = GridSearchCV(RandomForestClassifier(), rf_params, cv=5, scoring='accuracy')
-rf.fit(X_train, y_train)
-y_pred_rf = rf.predict(X_test)
+# (Removed)
 
 # ===========================
 # 5. XGBoost
 # ===========================
-xgb_params = {'n_estimators':[50,100], 'max_depth':[2,3,4], 'learning_rate':[0.05,0.1,0.2]}
-xgb = GridSearchCV(
-    XGBClassifier(eval_metric='mlogloss', use_label_encoder=False),
-    xgb_params, cv=5, scoring='accuracy'
-)
-xgb.fit(X_train, y_train)
-y_pred_xgb = xgb.predict(X_test)
-
-# ===========================
-# 5b. Grey Wolf Optimizer (GWO) for RF Hyperparameter Tuning
-# ===========================
-def rf_fitness(params):
-    n_estimators = int(params[0])
-    max_depth = int(params[1])
-    clf = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=42)
-    clf.fit(X_train, y_train)
-    acc = clf.score(X_test, y_test)
-    return 1 - acc  # minimize error
-
-# Search space for RF
-problem = {
-    "fit_func": rf_fitness,
-    "lb": [50, 2],
-    "ub": [300, 15],
-    "minmax": "min",
-}
-
-# Run GWO
-gwo_model = GWO.OriginalGWO(epoch=30, pop_size=30)
-best_params_gwo, best_fitness_gwo = gwo_model.solve(problem)
-print("\n[Grey Wolf Optimizer]")
-print("Best RF Params:", best_params_gwo)
-print("Best Accuracy:", 1 - best_fitness_gwo)
-
-# Train RF with GWO params
-rf_gwo = RandomForestClassifier(
-    n_estimators=int(best_params_gwo[0]),
-    max_depth=int(best_params_gwo[1]),
-    random_state=42
-)
-rf_gwo.fit(X_train, y_train)
-y_pred_gwo = rf_gwo.predict(X_test)
-
-
-# ===========================
-# 6. Bi-LSTM (separate split)
-# ===========================
-X_lstm = X_scaled.reshape((X_scaled.shape[0], X_scaled.shape[1], 1))
-X_train_lstm, X_test_lstm, y_train_lstm, y_test_lstm = train_test_split(
-    X_lstm, y, test_size=0.3, random_state=42, stratify=y
-)
+# (Removed)
 
 # ===========================
 # 6. Bi-LSTM optimized with GWO
 # ===========================
-
-# Reshape for LSTM (samples, timesteps=features, features=1)
 X_lstm = X_scaled.reshape((X_scaled.shape[0], X_scaled.shape[1], 1))
 X_train_lstm, X_test_lstm, y_train_lstm, y_test_lstm = train_test_split(
     X_lstm, y, test_size=0.3, random_state=42, stratify=y
 )
 
+# Global tracker for best accuracy
+best_accuracy_seen = 0.0
+
 # Fitness function for GWO → Bi-LSTM
 def bilstm_fitness(params):
+    global best_accuracy_seen
+
     units1 = int(params[0])        # first LSTM layer units
     units2 = int(params[1])        # second LSTM layer units
     dropout1 = float(params[2])    # dropout rate 1
@@ -139,7 +86,8 @@ def bilstm_fitness(params):
     lr = float(params[4])          # learning rate
     
     model = Sequential()
-    model.add(Bidirectional(LSTM(units1, return_sequences=True), input_shape=(X_train_lstm.shape[1], 1)))
+    model.add(Input(shape=(X_train_lstm.shape[1], 1)))
+    model.add(Bidirectional(LSTM(units1, return_sequences=True)))
     model.add(Dropout(dropout1))
     model.add(Bidirectional(LSTM(units2)))
     model.add(Dense(32, activation='relu'))
@@ -149,34 +97,44 @@ def bilstm_fitness(params):
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
                   loss='binary_crossentropy', metrics=['accuracy'])
     
-    # Train for a few epochs just to evaluate fitness
-    history = model.fit(X_train_lstm, y_train_lstm,
-                        validation_data=(X_test_lstm, y_test_lstm),
-                        epochs=5, batch_size=64, verbose=0)
+    # Train briefly for evaluation
+    history = model.fit(
+        X_train_lstm, y_train_lstm,
+        validation_data=(X_test_lstm, y_test_lstm),
+        epochs=5, batch_size=128, verbose=0
+    )
     
-    acc = history.history['val_accuracy'][-1]
-    return 1 - acc   # minimize error
+    acc = history.history['val_accuracy'][-1] * 100  # percentage
+    
+    # Print each evaluation
+    print(f"[BiLSTM Evaluation] Params={params}, Accuracy={acc:.2f}%")
+    
+    # Track the best accuracy seen so far
+    if acc > best_accuracy_seen:
+        best_accuracy_seen = acc
+        print(f"New Best Accuracy Found: {best_accuracy_seen:.2f}%")
+    
+    return 1 - (acc / 100)   # minimize error
 
 # Search space: [units1, units2, dropout1, dropout2, lr]
 problem = {
     "fit_func": bilstm_fitness,
-    "lb": [32, 16, 0.1, 0.1, 0.0001],
-    "ub": [256, 128, 0.5, 0.5, 0.01],
+    "lb": [16, 8, 0.05, 0.05, 0.00001],
+    "ub": [512, 256, 0.6, 0.6, 0.05],
     "minmax": "min",
 }
 
 # Run GWO
-gwo_model = GWO.OriginalGWO(epoch=20, pop_size=25)  # keep small for speed
+gwo_model = GWO.OriginalGWO(epoch=5, pop_size=5)
 best_params, best_fitness = gwo_model.solve(problem)
 
 print("\n[Optimized Bi-LSTM Params with GWO]")
 print("Best Params:", best_params)
-print("Best Accuracy:", 1 - best_fitness)
+print(f"Best Accuracy Achieved During GWO: {best_accuracy_seen:.2f}%")
 
 # ===========================
-# Final Bi-LSTM training with best params
+# Final Bi-LSTM training with best params + EarlyStopping
 # ===========================
-from tensorflow.keras.callbacks import EarlyStopping
 units1 = int(best_params[0])
 units2 = int(best_params[1])
 dropout1 = float(best_params[2])
@@ -184,7 +142,8 @@ dropout2 = float(best_params[3])
 lr = float(best_params[4])
 
 final_model = Sequential()
-final_model.add(Bidirectional(LSTM(units1, return_sequences=True), input_shape=(X_train_lstm.shape[1], 1)))
+final_model.add(Input(shape=(X_train_lstm.shape[1], 1)))
+final_model.add(Bidirectional(LSTM(units1, return_sequences=True)))
 final_model.add(Dropout(dropout1))
 final_model.add(Bidirectional(LSTM(units2)))
 final_model.add(Dense(32, activation='relu'))
@@ -194,17 +153,29 @@ final_model.add(Dense(1, activation='sigmoid'))
 final_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
                     loss='binary_crossentropy', metrics=['accuracy'])
 
-# ✅ Add EarlyStopping here
-es = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+early_stop = EarlyStopping(
+    monitor='val_loss',
+    patience=10,
+    restore_best_weights=True
+)
 
-final_model.fit(X_train_lstm, y_train_lstm,
-                validation_data=(X_test_lstm, y_test_lstm),
-                epochs=50, batch_size=64, verbose=1,
-                callbacks=[es])
+history = final_model.fit(
+    X_train_lstm, y_train_lstm,
+    validation_data=(X_test_lstm, y_test_lstm),
+    epochs=200,
+    batch_size=64,
+    callbacks=[early_stop],
+    verbose=1
+)
 
 loss, acc = final_model.evaluate(X_test_lstm, y_test_lstm, verbose=0)
-print("Final GWO-Optimized Bi-LSTM Accuracy:", acc)
+print(f"Final GWO-Optimized Bi-LSTM Accuracy: {acc*100:.2f}%")
 
+# ===========================
+# 7. Evaluation
+# ===========================
+print("\n--- Final Model Accuracy ---")
+print(f"Bi-LSTM (GWO-Optimized) Accuracy: {acc*100:.2f}%")
 
 # ===========================
 # 8. New Prediction Example
@@ -239,16 +210,8 @@ for col in new_data.select_dtypes(include=['object']).columns:
     new_data[col] = le.fit_transform(new_data[col].astype(str))
 
 new_data_scaled = scaler.transform(new_data)
-
-# Predictions
-prediction_rf = rf.best_estimator_.predict(new_data_scaled)
-prediction_gwo = rf_gwo.predict(new_data_scaled)
-
-# Use GWO-optimized Bi-LSTM
 new_data_lstm = new_data_scaled.reshape((new_data_scaled.shape[0], new_data_scaled.shape[1], 1))
 prediction_lstm = final_model.predict(new_data_lstm)
 
-print("\n--- New User Predictions ---")
-print("Random Forest (GridSearch):", prediction_rf[0])
-print("Random Forest (GWO):", prediction_gwo[0])
+print("\n--- New User Prediction ---")
 print("Bi-LSTM (GWO-Optimized):", int(prediction_lstm[0] > 0.5))
