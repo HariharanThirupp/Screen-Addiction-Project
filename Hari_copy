@@ -1,203 +1,311 @@
 # ===========================
-# Smartphone Addiction ML Project (Bi-LSTM + GWO Optimized)
+# Smartphone Addiction ML Project (FIXED COLLAPSE: Stronger L2, Custom LR Schedule)
 # ===========================
+
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # quiet TF logs
 
 import pandas as pd
 import numpy as np
+import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 
 # Deep Learning
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Dense, Dropout, LSTM, Bidirectional, Input
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import Dense, Dropout, LSTM, Bidirectional, Input, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, LearningRateScheduler
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import regularizers
+from tensorflow.keras.optimizers.schedules import ExponentialDecay # Needed for LR schedule
 
-# Metaheuristics
+# Metaheuristics (GWO)
 from mealpy.swarm_based import GWO
 
+# ---------------------------
+# Config (Optimized for better accuracy)
+# ---------------------------
+DATA_PATH = "teen_phone_addiction_dataset.csv"
+ENCODERS_PATH = "label_encoders.pkl"
+SCALER_PATH = "scaler.pkl"
+MODEL_PATH = "final_bilstm_gwo_model.h5"
 
-# ===========================
-# 1. Load Dataset
-# ===========================
-df = pd.read_csv("teen_phone_addiction_dataset.csv")
+# GWO settings (Optimized search space quality)
+GWO_EPOCHS = 15    # Increased GWO epochs for deeper search
+GWO_POP    = 20    # Increased population size for wider search
+FIT_EPOCHS = 10    # Increased training epochs inside GWO for reliable fitness score
+FINAL_EPOCHS = 100 # final full training epochs
+BATCH_SIZE_FINAL = 64 # Increased batch size for stability
 
-# Binary Target
-df["Addiction_Class"] = df["Addiction_Level"].apply(lambda x: 1 if x >= 8.0 else 0)
-
-# Features & Target
-X = df.drop(["ID", "Name", "Addiction_Level", "Addiction_Class"], axis=1)
-y = df["Addiction_Class"].values
-
-# Encode categorical features
-for col in X.select_dtypes(include=['object']).columns:
-    le = LabelEncoder()
-    X[col] = le.fit_transform(X[col].astype(str))
-
-# Normalize
+# Global Objects
+encoders = {}
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-
-# Train-Test Split
-X_train, X_test, y_train, y_test = train_test_split(
-    X_scaled, y, test_size=0.3, random_state=42, stratify=y
-)
-
-# ===========================
-# 2. Reshape for Bi-LSTM
-# ===========================
-X_lstm = X_scaled.reshape((X_scaled.shape[0], X_scaled.shape[1], 1))
-X_train_lstm, X_test_lstm, y_train_lstm, y_test_lstm = train_test_split(
-    X_lstm, y, test_size=0.3, random_state=42, stratify=y
-)
-
-# Compute class weights
-class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
-class_weights_dict = {i: class_weights[i] for i in range(len(class_weights))}
-
-# Global tracker for best accuracy
 best_accuracy_seen = 0.0
 
-# ===========================
-# 3. Fitness function for GWO → Bi-LSTM
-# ===========================
+# Define a higher regularization rate to fight collapse
+L2_RATE = 5e-4 # Increased from 1e-4
+
+# ---------------------------
+# 1. Load dataset & Feature engineering
+# ---------------------------
+df = pd.read_csv(DATA_PATH)
+df["Addiction_Class"] = df["Addiction_Level"].apply(lambda x: 1 if x >= 8.0 else 0)
+
+# Feature engineering (derived features)
+df["Usage_to_Sleep"] = df["Daily_Usage_Hours"] / (df["Sleep_Hours"] + 1e-6)
+df["Social_vs_Edu"] = df["Time_on_Social_Media"] / (df["Time_on_Education"] + 1e-6)
+df["Gaming_Intensity"] = df["Time_on_Gaming"] / (df["Daily_Usage_Hours"] + 1e-6)
+df["Total_Leisure"] = df["Time_on_Social_Media"] + df["Time_on_Gaming"]
+df["Weekend_Ratio"] = df["Weekend_Usage_Hours"] / (df["Daily_Usage_Hours"] + 1e-6)
+
+# ---------------------------
+# 2. Prepare X, y, and Encode
+# ---------------------------
+DROPPED_COLUMNS = ["ID", "Name", "Addiction_Level", "Addiction_Class"]
+X = df.drop(DROPPED_COLUMNS, axis=1)
+y = df["Addiction_Class"].values
+X_columns = X.columns.tolist()  
+
+# Encode categorical columns
+for col in X.select_dtypes(include=["object"]).columns:
+    le = LabelEncoder()
+    X[col] = le.fit_transform(X[col].astype(str))
+    encoders[col] = le
+joblib.dump(encoders, ENCODERS_PATH)
+
+
+# ---------------------------
+# 3. Train-test split (using original unbalanced data)
+# ---------------------------
+# The dataset is UNBALANCED.
+X_train_df, X_test_df, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y
+)
+print("Class distribution (Original):", np.bincount(y))
+print("Class distribution (Training Data):", np.bincount(y_train))
+
+
+# ---------------------------
+# 4. Scale (fit scaler on train, save)
+# ---------------------------
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train_df)
+X_test = scaler.transform(X_test_df)
+joblib.dump(scaler, SCALER_PATH)
+
+# Reshape for LSTM
+X_train_lstm = X_train.reshape((X_train.shape[0], X_train.shape[1], 1))
+X_test_lstm  = X_test.reshape((X_test.shape[0], X_test.shape[1], 1))
+
+# Compute class weights (CRUCIAL for unbalanced data)
+class_weights = compute_class_weight(class_weight="balanced", classes=np.unique(y_train), y=y_train)
+class_weights_dict = {i: class_weights[i] for i in range(len(class_weights))}
+print(f"Computed Class Weights: {class_weights_dict}")
+
+
+# ---------------------------
+# 5. Fitness function for GWO (tune Bi-LSTM hyperparams)
+# ---------------------------
 def bilstm_fitness(params):
     global best_accuracy_seen
-
     units1 = int(params[0])
     units2 = int(params[1])
     dropout1 = float(params[2])
     dropout2 = float(params[3])
     lr = float(params[4])
 
+    # GWO Model (L2_RATE used here too for consistency)
     model = Sequential()
     model.add(Input(shape=(X_train_lstm.shape[1], 1)))
-    model.add(Bidirectional(LSTM(units1, return_sequences=True)))
+    model.add(Bidirectional(LSTM(units1, return_sequences=True, kernel_regularizer=regularizers.l2(L2_RATE))))
+    model.add(BatchNormalization())
     model.add(Dropout(dropout1))
-    model.add(Bidirectional(LSTM(units2)))
-    model.add(Dense(32, activation='relu'))
+
+    model.add(Bidirectional(LSTM(units2, kernel_regularizer=regularizers.l2(L2_RATE))))
+    model.add(BatchNormalization())
+    model.add(Dense(64, activation="relu", kernel_regularizer=regularizers.l2(L2_RATE)))
     model.add(Dropout(dropout2))
-    model.add(Dense(1, activation='sigmoid'))
+    model.add(Dense(1, activation="sigmoid"))
 
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-                  loss='binary_crossentropy', metrics=['accuracy'])
+    model.compile(optimizer=Adam(learning_rate=lr), loss="binary_crossentropy", metrics=["accuracy"])
 
-    # Train briefly for evaluation (NO test set leakage)
     history = model.fit(
-        X_train_lstm, y_train_lstm,
-        validation_split=0.2,
-        epochs=3, batch_size=128, verbose=0,
+        X_train_lstm, y_train,
+        validation_split=0.15,
+        epochs=FIT_EPOCHS,
+        batch_size=128,
+        verbose=0,
         class_weight=class_weights_dict
     )
 
-    acc = history.history['val_accuracy'][-1] * 100
-    print(f"[BiLSTM Evaluation] Params={params}, Accuracy={acc:.2f}%")
+    val_acc = history.history["val_accuracy"][-1] * 100
+    print(f"[GWO Eval] params={params}, val_acc={val_acc:.2f}%")
 
-    if acc > best_accuracy_seen:
-        best_accuracy_seen = acc
-        print(f"New Best Accuracy Found: {best_accuracy_seen:.2f}%")
+    if val_acc > best_accuracy_seen:
+        best_accuracy_seen = val_acc
+        print(f"New best during GWO: {best_accuracy_seen:.2f}%")
 
-    return 1 - (acc / 100)
+    return 1.0 - (val_acc / 100.0)  # mealpy minimizes
 
-# ===========================
-# 4. GWO Hyperparameter Search
-# ===========================
+
+# ---------------------------
+# 6. GWO search space & run
+# ---------------------------
 problem = {
     "fit_func": bilstm_fitness,
-    "lb": [32, 16, 0.2, 0.2, 0.0001],
-    "ub": [256, 128, 0.5, 0.5, 0.01],
+    "lb": [32, 16, 0.2, 0.2, 1e-4],
+    "ub": [256, 128, 0.5, 0.5, 1e-2],
     "minmax": "min",
 }
 
-gwo_model = GWO.OriginalGWO(epoch=20, pop_size=25)
+print(f"\nRunning GWO search (GWO_EPOCHS: {GWO_EPOCHS}, POP: {GWO_POP})")
+gwo_model = GWO.OriginalGWO(epoch=GWO_EPOCHS, pop_size=GWO_POP)
 best_params, best_fitness = gwo_model.solve(problem)
 
-print("\n[Optimized Bi-LSTM Params with GWO]")
-print("Best Params:", best_params)
-print(f"Best Accuracy Achieved During GWO: {best_accuracy_seen:.2f}%")
+print("\n[GWO Done]")
+print("Best params (raw):", best_params)
+print(f"Best val accuracy seen during GWO: {best_accuracy_seen:.2f}%")
 
-# ===========================
-# 5. Final Bi-LSTM Training + Save Model
-# ===========================
 units1 = int(best_params[0])
 units2 = int(best_params[1])
 dropout1 = float(best_params[2])
 dropout2 = float(best_params[3])
-lr = float(best_params[4])
+lr_gwo = float(best_params[4]) # Renamed to lr_gwo to avoid conflict
 
-final_model = Sequential()
-final_model.add(Input(shape=(X_train_lstm.shape[1], 1)))
-final_model.add(Bidirectional(LSTM(units1, return_sequences=True)))
-final_model.add(Dropout(dropout1))
-final_model.add(Bidirectional(LSTM(units2)))
-final_model.add(Dense(32, activation='relu'))
-final_model.add(Dropout(dropout2))
-final_model.add(Dense(1, activation='sigmoid'))
 
-final_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-                    loss='binary_crossentropy', metrics=['accuracy'])
+# ---------------------------
+# 7. Final model build & training (3-Layer Bi-LSTM with Strong Regularization)
+# ---------------------------
+final_model = Sequential([
+    Input(shape=(X_train_lstm.shape[1], 1)),
+    
+    # Layer 1: Return sequences
+    Bidirectional(LSTM(units1, return_sequences=True, 
+                       kernel_regularizer=regularizers.l2(L2_RATE))), # Increased L2
+    BatchNormalization(),
+    Dropout(dropout1),
 
-early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    # Layer 2: Intermediate Bi-LSTM (for deep feature extraction)
+    Bidirectional(LSTM(int(units1/2), return_sequences=True, 
+                       kernel_regularizer=regularizers.l2(L2_RATE))), # Increased L2
+    BatchNormalization(),
+    Dropout(0.3),
 
+    # Layer 3: Final sequence layer (return single output)
+    Bidirectional(LSTM(units2, return_sequences=False, 
+                       kernel_regularizer=regularizers.l2(L2_RATE))), # Increased L2
+    BatchNormalization(),
+    
+    Dense(64, activation="relu", kernel_regularizer=regularizers.l2(L2_RATE)), # Increased L2
+    Dropout(dropout2),
+    Dense(1, activation="sigmoid")
+])
+
+# Custom Learning Rate Scheduler (Overrides GWO's LR for stability)
+def lr_schedule(epoch):
+    """Starts low, warms up, then decays smoothly."""
+    initial_lr = 1e-3 # Fixed optimal starting point
+    warm_up_epochs = 5
+    decay_rate = 0.95
+    decay_step = 1
+    
+    if epoch < warm_up_epochs:
+        # Linear warm-up
+        return initial_lr * (epoch / warm_up_epochs)
+    else:
+        # Exponential decay
+        return initial_lr * decay_rate ** ((epoch - warm_up_epochs) / decay_step)
+
+# Compile using the scheduled LR
+final_model.compile(optimizer=Adam(learning_rate=lr_schedule(0)),
+                    loss="binary_crossentropy",
+                    metrics=["accuracy"])
+
+# Callbacks
+early_stop = EarlyStopping(monitor="val_loss", patience=12, restore_best_weights=True, verbose=1)
+# Removed ReduceLROnPlateau since we are using a custom scheduler
+checkpoint = ModelCheckpoint(MODEL_PATH, monitor="val_accuracy", save_best_only=True, mode="max", verbose=1)
+lr_scheduler = LearningRateScheduler(lr_schedule) # Using the custom scheduler
+
+print("\nTraining final model (UNCOLLAPSED: Strong L2 + Custom LR Schedule)...")
 history = final_model.fit(
-    X_train_lstm, y_train_lstm,
-    validation_data=(X_test_lstm, y_test_lstm),
-    epochs=100, batch_size=64,
-    class_weight=class_weights_dict,
-    callbacks=[early_stop],
+    X_train_lstm, y_train,
+    validation_data=(X_test_lstm, y_test),
+    epochs=FINAL_EPOCHS,
+    batch_size=BATCH_SIZE_FINAL,
+    class_weight=class_weights_dict, 
+    callbacks=[early_stop, checkpoint, lr_scheduler], # Only these three callbacks
     verbose=1
 )
 
-loss, acc = final_model.evaluate(X_test_lstm, y_test_lstm, verbose=0)
-print(f"Final GWO-Optimized Bi-LSTM Accuracy: {acc*100:.2f}%")
+# Evaluate
+loss, acc = final_model.evaluate(X_test_lstm, y_test, verbose=0)
+print(f"\nFinal Test Accuracy: {acc*100:.2f}%")
 
-# Save trained model
-final_model.save("bilstm_gwo_model.h5")
+y_pred_prob = final_model.predict(X_test_lstm)
+y_pred = (y_pred_prob > 0.5).astype(int).reshape(-1)
+print("\nClassification Report:\n", classification_report(y_test, y_pred))
+print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
 
-# ===========================
-# 6. Evaluation
-# ===========================
-print("\n--- Final Model Accuracy ---")
-print(f"Bi-LSTM (GWO-Optimized) Accuracy: {acc*100:.2f}%")
-print("\nClassification Report:\n", classification_report(y_test, (final_model.predict(X_test_lstm) > 0.5).astype(int)))
-print("\nConfusion Matrix:\n", confusion_matrix(y_test, (final_model.predict(X_test_lstm) > 0.5).astype(int)))
+final_model.save(MODEL_PATH)
+print("Saved final model to:", MODEL_PATH)
 
-# ===========================
-# 7. New Prediction Example
-# ===========================
+# ---------------------------
+# 8. Example: new user prediction
+# ---------------------------
 new_data = pd.DataFrame([{
-    "Age": 16,
-    "Gender": "Male",
-    "School_Grade": "11th",
-    "Daily_Usage_Hours": 9,
-    "Sleep_Hours": 3.5,
-    "Academic_Performance": 45,
-    "Social_Interactions": 2,
-    "Exercise_Hours": 0.5,
-    "Anxiety_Level": 8,
-    "Depression_Level": 7,
-    "Self_Esteem": 2,
-    "Parental_Control": 1,
-    "Screen_Time_Before_Bed": 3,
-    "Phone_Checks_Per_Day": 120,
-    "Apps_Used_Daily": 15,
-    "Time_on_Social_Media": 5,
-    "Time_on_Gaming": 4,
-    "Time_on_Education": 0.5,
-    "Phone_Usage_Purpose": "Gaming",
-    "Family_Communication": 2,
-    "Weekend_Usage_Hours": 12
+    "Age": 16, "Gender": "Male", "School_Grade": "11th", "Daily_Usage_Hours": 9,
+    "Sleep_Hours": 3.5, "Academic_Performance": 45, "Social_Interactions": 2,
+    "Exercise_Hours": 0.5, "Anxiety_Level": 8, "Depression_Level": 7,
+    "Self_Esteem": 2, "Parental_Control": 1, "Screen_Time_Before_Bed": 3,
+    "Phone_Checks_Per_Day": 120, "Apps_Used_Daily": 15, "Time_on_Social_Media": 5,
+    "Time_on_Gaming": 4, "Time_on_Education": 0.5, "Phone_Usage_Purpose": "Gaming",
+    "Family_Communication": 2, "Weekend_Usage_Hours": 12
 }])
 
-for col in new_data.select_dtypes(include=['object']).columns:
-    le = LabelEncoder()
-    new_data[col] = le.fit_transform(new_data[col].astype(str))
+# ensure the new_data has engineered features
+new_data["Usage_to_Sleep"] = new_data["Daily_Usage_Hours"] / (new_data["Sleep_Hours"] + 1e-6)
+new_data["Social_vs_Edu"] = new_data["Time_on_Social_Media"] / (new_data["Time_on_Education"] + 1e-6)
+new_data["Gaming_Intensity"] = new_data["Time_on_Gaming"] / (new_data["Daily_Usage_Hours"] + 1e-6)
+new_data["Total_Leisure"] = new_data["Time_on_Social_Media"] + new_data["Time_on_Gaming"]
+new_data["Weekend_Ratio"] = new_data["Weekend_Usage_Hours"] / (new_data["Daily_Usage_Hours"] + 1e-6)
 
+# align columns 
+for c in X_columns:
+    if c not in new_data.columns:
+        new_data[c] = 0
+
+new_data = new_data[X_columns]  # enforce order
+
+# load encoders and apply 
+encoders = joblib.load(ENCODERS_PATH)
+for col in new_data.select_dtypes(include=["object"]).columns:
+    if col in encoders:
+        le = encoders[col]
+        # Transform or default to 0 if label is unseen
+        vals = new_data[col].astype(str).tolist()
+        transformed = []
+        known_classes = set(le.classes_.astype(str).tolist())
+        for v in vals:
+            if v in known_classes:
+                transformed.append(le.transform([v])[0])
+            else:
+                transformed.append(0) 
+        new_data[col] = transformed
+    else:
+        new_data[col] = new_data[col].astype(float)
+
+
+# scale with saved scaler
+scaler = joblib.load(SCALER_PATH)
 new_data_scaled = scaler.transform(new_data)
 new_data_lstm = new_data_scaled.reshape((new_data_scaled.shape[0], new_data_scaled.shape[1], 1))
-prediction_lstm = final_model.predict(new_data_lstm)
+
+pred_prob = final_model.predict(new_data_lstm)
+pred_class = int((pred_prob[0][0] > 0.5).item()) 
 
 print("\n--- New User Prediction ---")
-print("Bi-LSTM (GWO-Optimized):", int(prediction_lstm[0] > 0.5))
+print("Predicted class (1 = High risk):", pred_class, " (probability: {:.3f})".format(pred_prob[0][0]))
